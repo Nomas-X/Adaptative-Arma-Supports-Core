@@ -1,9 +1,9 @@
-// AAS-Logistics/functions/fn_serverdelivery.sqf
 /* Author: AAS Team
-    Description: Master Route for Slingload Deliveries.
-    Dynamically spawns the correct heavy helicopter, attaches the payload via setSlingLoad,
-    drops it at the LZ natively, and handles manual "Containerized" repositioning and unpacking.
-    Includes STRICT autonomous override, Dynamic Terrain Snap, CTRL+Z Repack, Hold-Actions, Anti-Jank Physics, and Script/Inventory Injection.
+   Description: Master Route for Slingload Deliveries.
+   Dynamically spawns the correct heavy helicopter, attaches the payload via setSlingLoad,
+   drops it at the LZ natively, and handles manual "Containerized" repositioning and unpacking.
+   Includes STRICT autonomous override, Dynamic Terrain Snap, CTRL+Z Repack, Hold-Actions, Anti-Jank Physics, and Script/Inventory Injection.
+   NOW INCLUDES: "Force Rope" toggle for bypassing config restrictions with custom Hover & Slice AI logic.
 */
 
 params ["_caller", "_lzPos", "_execId"];
@@ -114,6 +114,9 @@ private _rawHeliClass = "";
 private _targetClass = "";
 private _targetLoadout = false;
 
+// --- DYNAMIC TOGGLE READ ---
+private _forceRope = missionNamespace getVariable [format ["AAS_LOG_%1_ForceRope", _execId], false];
+
 if (_isComposition) then {
     _isContainerized = true;
     _rawHeliClass = missionNamespace getVariable ["AAS_LOG_Comp_Heli", "B_Heli_Transport_03_F"];
@@ -190,7 +193,20 @@ if (_isContainerized) then {
 };
 
 _payloadObj allowDamage false;
-_heli setSlingLoad _payloadObj;
+
+// --- DYNAMIC HOOKUP (VANILLA OR FORCE ROPES) ---
+if (_forceRope) then {
+    private _ropeLength = 15;
+    ropeCreate [_heli, [0, 0, -2], _payloadObj, [1.5, 1.5, 0], _ropeLength];
+    ropeCreate [_heli, [0, 0, -2], _payloadObj, [-1.5, 1.5, 0], _ropeLength];
+    ropeCreate [_heli, [0, 0, -2], _payloadObj, [1.5, -1.5, 0], _ropeLength];
+    ropeCreate [_heli, [0, 0, -2], _payloadObj, [-1.5, -1.5, 0], _ropeLength];
+    
+    // TRANSIT FIX: Cap transit speed so the custom pendulum doesn't flip the heli
+    _heli limitSpeed 110; 
+} else {
+    _heli setSlingLoad _payloadObj;
+};
 
 // 4c. Waypoints - THE BAIT
 private _wpMove = _heliGroup addWaypoint [_lzPos, 0];
@@ -200,8 +216,9 @@ _wpMove setWaypointSpeed "FULL";
 // ==========================================
 // --- 5. EXECUTION THREAD ---
 // ==========================================
-[_heli, _heliGroup, _payloadObj, _isContainerized, _targetClass, _targetLoadout, _helipad, _lzPos, _playerSide, _execId, _caller] spawn {
-    params ["_heli", "_heliGroup", "_payloadObj", "_isContainerized", "_targetClass", "_targetLoadout", "_helipad", "_lzPos", "_playerSide", "_execId", "_caller"];
+// FIX: Added _forceRope to passed parameters
+[_heli, _heliGroup, _payloadObj, _isContainerized, _forceRope, _targetClass, _targetLoadout, _helipad, _lzPos, _playerSide, _execId, _caller] spawn {
+    params ["_heli", "_heliGroup", "_payloadObj", "_isContainerized", "_forceRope", "_targetClass", "_targetLoadout", "_helipad", "_lzPos", "_playerSide", "_execId", "_caller"];
     
     // --- APPROACH COMMS (Trigger at 400m) ---
     waitUntil { sleep 0.5; (_heli distance2D _lzPos < 400) || !alive _heli };
@@ -219,25 +236,107 @@ _wpMove setWaypointSpeed "FULL";
         [_selected select 0] remoteExec ["playSound", _caller];
     };
 
-    // --- THE SWITCH (Drop Cargo at 120m) ---
-    waitUntil { sleep 0.25; (_heli distance2D _lzPos < 120) || !alive _heli };
-    
-    if (alive _heli) then {
-        while {(count (waypoints _heliGroup)) > 0} do {
-            deleteWaypoint ((waypoints _heliGroup) select 0);
+    // --- THE SWITCH (Drop Cargo Logic) ---
+    private _despawnPos = _lzPos getPos [3000, random 360];
+    if (_forceRope) then {
+        
+        // 1. APPROACH PHASE: AI waypoints bring it close
+        waitUntil { sleep 0.5; (_heli distance2D _lzPos < 150) || !alive _heli };
+        
+        if (alive _heli) then {
+            while {(count (waypoints _heliGroup)) > 0} do { deleteWaypoint ((waypoints _heliGroup) select 0); };
+            
+            // 2. GUIDED GLIDE: Smooth velocity control replaces doMove
+            // Speed is proportional to distance — fast when far, crawling when close
+            _heli flyInHeight 32;
+            _heli forceSpeed 1000; // Remove AI speed cap so it doesn't fight our velocity
+            
+            private _glideTimeout = serverTime + 60;
+            while { alive _heli && (_heli distance2D _lzPos > 5) && serverTime < _glideTimeout } do {
+                private _dist = _heli distance2D _lzPos;
+                private _dir = _heli getDir _lzPos;
+                
+                // Smooth speed curve: 10 m/s at 150m, ~2 m/s at 10m, floor of 1.5 m/s
+                private _speed = ((_dist / 5) min 8) max 3.5;
+                
+                private _vx = (sin _dir) * _speed;
+                private _vy = (cos _dir) * _speed;
+                
+                // Altitude correction — gently steer toward 45m AGL above the LZ
+                private _targetAlt = (getTerrainHeightASL _lzPos) + 32;
+                private _currentAlt = (getPosASL _heli) select 2;
+                private _vz = ((_targetAlt - _currentAlt) * 0.3) max -2 min 2;
+                
+                _heli setVelocity [_vx, _vy, _vz];
+                sleep 0.1;
+            };
+            
+            if (alive _heli) then {
+                // 3. DECELERATION: Ease to a stop over 2 seconds instead of instant freeze
+                private _vel = velocity _heli;
+                for "_i" from 1 to 20 do {
+                    private _factor = 1 - (_i / 20);
+                    _heli setVelocity [
+                        (_vel select 0) * _factor,
+                        (_vel select 1) * _factor,
+                        ((_vel select 2) * _factor) max -0.3
+                    ];
+                    sleep 0.1;
+                };
+                
+                // 4. HOVER LOCK: Now the AI takes over for a clean stationary hover
+                _heli setVelocity [0, 0, 0];
+                doStop _heli;
+                _heli forceSpeed 0;
+                
+                // Let the payload pendulum settle
+                sleep 4;
+                
+                // 5. THE WINCH: Unspool ropes
+                { ropeUnwind [_x, 5, 150] } forEach ropes _heli;
+                
+                // Wait until payload touches ground
+                private _dropTimeout = serverTime + 40;
+                waitUntil { sleep 0.25; isTouchingGround _payloadObj || ((getPos _payloadObj) select 2 < 1) || serverTime > _dropTimeout || !alive _heli };
+                
+                // 6. Slice the custom ropes
+                { ropeDestroy _x } forEach ropes _heli;
+                
+                // 7. EVACUATION: Reset and move away
+                _heli forceSpeed 1000;
+                _heli flyInHeight 150;
+                _heli doMove _despawnPos;
+                
+                private _wpLeave = _heliGroup addWaypoint [_despawnPos, 0];
+                _wpLeave setWaypointType "MOVE";
+                _wpLeave setWaypointSpeed "FULL";
+            };
         };
         
-        private _wpDrop = _heliGroup addWaypoint [_lzPos, 0];
-        _wpDrop setWaypointType "UNHOOK";
-        _wpDrop setWaypointSpeed "FULL";
+    } else {
+        // VANILLA DROP MANEUVER (UNHOOK)
+        waitUntil { sleep 0.25; (_heli distance2D _lzPos < 120) || !alive _heli };
         
-        private _despawnPos = _lzPos getPos [3000, random 360];
-        private _wpLeave = _heliGroup addWaypoint [_despawnPos, 0];
-        _wpLeave setWaypointType "MOVE";
-        _wpLeave setWaypointSpeed "FULL";
+        if (alive _heli) then {
+            while {(count (waypoints _heliGroup)) > 0} do { deleteWaypoint ((waypoints _heliGroup) select 0); };
+            
+            private _wpDrop = _heliGroup addWaypoint [_lzPos, 0];
+            _wpDrop setWaypointType "UNHOOK";
+            _wpDrop setWaypointSpeed "FULL";
+            
+            private _wpLeave = _heliGroup addWaypoint [_despawnPos, 0];
+            _wpLeave setWaypointType "MOVE";
+            _wpLeave setWaypointSpeed "FULL";
+        };
     };
 
-    waitUntil { sleep 1; (isNull (getSlingLoad _heli)) || !alive _heli };
+    // --- DETACHMENT VERIFICATION ---
+    if (_forceRope) then {
+        waitUntil { sleep 1; (count ropes _heli == 0) || !alive _heli };
+    } else {
+        waitUntil { sleep 1; (isNull (getSlingLoad _heli)) || !alive _heli };
+    };
+    
     _heli flyInHeight 150;
 
     if (alive _payloadObj) then {
